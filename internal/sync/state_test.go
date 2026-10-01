@@ -858,3 +858,93 @@ func TestConfigHashPersistence(t *testing.T) {
 		t.Errorf("expected config hash 'testhash123', got %q", loaded.ConfigHash)
 	}
 }
+
+func TestUnchangedChildren(t *testing.T) {
+	synced := time.Date(2025, 1, 10, 12, 0, 0, 0, time.UTC)
+	leaf := &Children{}
+	parent := &Children{Pages: []ChildRef{{ID: "child", Title: "Child"}}}
+
+	state := NewSyncState()
+	state.SetResource(ResourceState{ID: "leaf", Type: ResourceTypePage, LastModified: synced, Children: leaf})
+	state.SetResource(ResourceState{ID: "parent", Type: ResourceTypePage, LastModified: synced, Children: parent})
+	state.SetResource(ResourceState{ID: "old", Type: ResourceTypePage, LastModified: synced})
+
+	tests := []struct {
+		name         string
+		id           string
+		lastModified time.Time
+		want         *Children
+	}{
+		{"unchanged leaf", "leaf", synced, leaf},
+		{"unchanged parent", "parent", synced, parent},
+		{"changed", "parent", synced.Add(time.Minute), nil},
+		{"children unknown", "old", synced, nil},
+		{"new page", "new", synced, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := state.UnchangedChildren(tt.id, tt.lastModified); got != tt.want {
+				t.Errorf("UnchangedChildren() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUnchangedEntryChildren(t *testing.T) {
+	synced := time.Date(2025, 1, 10, 12, 0, 0, 0, time.UTC)
+	children := &Children{}
+	state := NewSyncState()
+	state.SetResource(ResourceState{ID: "db", Type: ResourceTypeDatabase})
+	_ = state.SetEntry("db", EntryState{PageID: "row", LastModified: synced, Children: children})
+	_ = state.SetEntry("db", EntryState{PageID: "old", LastModified: synced})
+
+	if got := state.UnchangedEntryChildren("db", "row", synced); got != children {
+		t.Errorf("unchanged row = %+v, want its children", got)
+	}
+	if got := state.UnchangedEntryChildren("db", "row", synced.Add(time.Second)); got != nil {
+		t.Errorf("changed row = %+v, want nil", got)
+	}
+	if got := state.UnchangedEntryChildren("db", "old", synced); got != nil {
+		t.Errorf("row with unknown children = %+v, want nil", got)
+	}
+}
+
+func TestLoadState_ChildrenUnknownVersusNone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	// A state written before children were recorded.
+	old := `{"version":1,"resources":{
+		"page":{"id":"page","type":"page","last_modified":"2025-01-10T12:00:00Z","local_path":"Page.md"},
+		"db":{"id":"db","type":"database","entries":{"row":{"page_id":"row","last_modified":"2025-01-10T12:00:00Z","local_file":"Row.md"}}}}}`
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := LoadState(path)
+	if err != nil {
+		t.Fatalf("LoadState() error = %v", err)
+	}
+	if state.GetResource("page").Children != nil || state.GetEntry("db", "row").Children != nil {
+		t.Fatal("old state should load with children unknown")
+	}
+
+	// Once recorded, a leaf's empty children must survive a round trip as
+	// known, or it would be refetched every run.
+	res := state.GetResource("page")
+	res.Children = &Children{}
+	state.SetResource(*res)
+	entry := state.GetEntry("db", "row")
+	entry.Children = &Children{}
+	if err := state.SetEntry("db", *entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.GetResource("page").Children == nil || reloaded.GetEntry("db", "row").Children == nil {
+		t.Error("empty children did not round-trip as known")
+	}
+}

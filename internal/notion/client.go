@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/jomei/notionapi"
@@ -31,9 +32,10 @@ type Resource struct {
 
 // Client wraps the Notion API client with rate limiting and convenience methods.
 type Client struct {
-	api     *notionapi.Client
-	limiter *RateLimiter
-	logger  *slog.Logger
+	api      *notionapi.Client
+	limiter  *RateLimiter
+	logger   *slog.Logger
+	requests *atomic.Int64
 }
 
 // apiRequestTimeout bounds each Notion API request. Without it a connection
@@ -45,16 +47,48 @@ func NewClient(token string, logger *slog.Logger) *Client {
 	return newClient(token, logger, &http.Client{Timeout: apiRequestTimeout})
 }
 
+// NewClientWithHTTPClient creates a client that sends requests through
+// httpClient, so tests can point it at a fake Notion server.
+func NewClientWithHTTPClient(token string, logger *slog.Logger, httpClient *http.Client) *Client {
+	return newClient(token, logger, httpClient)
+}
+
 func newClient(token string, logger *slog.Logger, httpClient *http.Client) *Client {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
+	requests := &atomic.Int64{}
+	counted := *httpClient
+	counted.Transport = countingTransport{next: httpClient.Transport, count: requests}
+
 	return &Client{
-		api:     notionapi.NewClient(notionapi.Token(token), notionapi.WithHTTPClient(httpClient)),
-		limiter: DefaultRateLimiter(),
-		logger:  logger,
+		api:      notionapi.NewClient(notionapi.Token(token), notionapi.WithHTTPClient(&counted)),
+		limiter:  DefaultRateLimiter(),
+		logger:   logger,
+		requests: requests,
 	}
+}
+
+// countingTransport counts the HTTP requests sent to Notion, so a sync can
+// report how many API calls it made.
+type countingTransport struct {
+	next  http.RoundTripper
+	count *atomic.Int64
+}
+
+func (t countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.count.Add(1)
+	next := t.next
+	if next == nil {
+		next = http.DefaultTransport
+	}
+	return next.RoundTrip(req)
+}
+
+// RequestCount returns how many HTTP requests the client has sent.
+func (c *Client) RequestCount() int64 {
+	return c.requests.Load()
 }
 
 // DetectResourceType tries to determine if an ID refers to a page or database.
@@ -259,6 +293,14 @@ func (c *Client) DiscoverWorkspaceRoots(ctx context.Context) ([]Resource, error)
 		return nil, fmt.Errorf("searching databases: %w", err)
 	}
 
+	roots := WorkspaceRoots(pages, databases)
+	c.logger.Info("discovered workspace roots", "count", len(roots))
+	return roots, nil
+}
+
+// WorkspaceRoots returns the pages and databases among search results
+// whose parent is the workspace.
+func WorkspaceRoots(pages, databases []notionapi.Object) []Resource {
 	var roots []Resource
 	for _, obj := range pages {
 		if page, ok := obj.(*notionapi.Page); ok {
@@ -287,9 +329,19 @@ func (c *Client) DiscoverWorkspaceRoots(ctx context.Context) ([]Resource, error)
 			}
 		}
 	}
+	return roots
+}
 
-	c.logger.Info("discovered workspace roots", "count", len(roots))
-	return roots, nil
+// LastEditedTimes maps each page among search results to its
+// last_edited_time.
+func LastEditedTimes(pages []notionapi.Object) map[string]time.Time {
+	times := make(map[string]time.Time, len(pages))
+	for _, obj := range pages {
+		if page, ok := obj.(*notionapi.Page); ok {
+			times[string(page.ID)] = time.Time(page.LastEditedTime)
+		}
+	}
+	return times
 }
 
 // handleError processes API errors and handles rate limiting.

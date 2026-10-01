@@ -5,7 +5,7 @@ One-way sync tool from Notion to Obsidian via Notion API. Notoma is designed for
 ## Features
 
 - Sync Notion pages and databases to Obsidian-flavored markdown
-- Incremental updates — only sync pages modified since last run
+- Incremental updates — only sync pages modified since last run, including pages nested under unchanged parents
 - Database → Obsidian Bases (`.base` files) conversion
 - Attachment handling with automatic download
 - Rate limiting to respect Notion API limits
@@ -135,6 +135,8 @@ Names that differ only in case count as the same name. When two pages, entries o
 - Links to child pages point at the suffixed name.
 
 When a page is renamed in Notion, its file is moved to the new name. Notoma deletes the old file only if that file's `notion-id` matches the page.
+
+**Pages inside unshared synced blocks:** a page nested in a synced block whose original isn't shared with the integration is not picked up, even after access is granted, until its parent page changes or you run `notoma sync --force`.
 
 **Upgrading from an earlier version:** run `notoma sync --force` once. Files written by earlier versions have no `notion-id` frontmatter (pages) or use the older `notion_id` key (database entries). Until a file is rewritten, a renamed page leaves its old file behind.
 

@@ -20,12 +20,29 @@ const (
 	ResourceTypeDatabase ResourceType = "database"
 )
 
+// ChildRef identifies a child page or database found in a page's blocks.
+type ChildRef struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
+// Children records the child pages and databases in a page's blocks, so an
+// unchanged page's subtree can be walked without fetching its blocks: a
+// nested page's edit does not change its parent's last_edited_time.
+type Children struct {
+	Pages     []ChildRef `json:"pages,omitempty"`
+	Databases []ChildRef `json:"databases,omitempty"`
+}
+
 // EntryState tracks the sync state of a database entry (page within a database).
 type EntryState struct {
 	PageID       string    `json:"page_id"`
 	Title        string    `json:"title"`
 	LastModified time.Time `json:"last_modified"`
 	LocalFile    string    `json:"local_file"`
+	// Children is nil when unknown, as in states written before it was
+	// recorded, which means the entry's blocks must be fetched.
+	Children *Children `json:"children,omitempty"`
 }
 
 // ResourceState tracks the sync state of a Notion page or database.
@@ -36,6 +53,9 @@ type ResourceState struct {
 	LastModified time.Time             `json:"last_modified"`
 	LocalPath    string                `json:"local_path"`
 	Entries      map[string]EntryState `json:"entries,omitempty"`
+	// Children is nil when unknown, as in states written before it was
+	// recorded, which means the page's blocks must be fetched.
+	Children *Children `json:"children,omitempty"`
 }
 
 // AttachmentState tracks the sync state of a downloaded attachment.
@@ -289,6 +309,26 @@ func (s *SyncState) NeedsEntrySync(databaseID, entryID string, lastModified time
 	}
 	// Modified if the Notion timestamp is newer
 	return lastModified.After(entry.LastModified)
+}
+
+// UnchangedChildren returns the recorded children of a page unchanged
+// since lastModified, or nil if its blocks must be fetched because it
+// changed or its children are unknown.
+func (s *SyncState) UnchangedChildren(id string, lastModified time.Time) *Children {
+	res := s.GetResource(id)
+	if res == nil || lastModified.After(res.LastModified) {
+		return nil
+	}
+	return res.Children
+}
+
+// UnchangedEntryChildren is UnchangedChildren for a database entry.
+func (s *SyncState) UnchangedEntryChildren(databaseID, entryID string, lastModified time.Time) *Children {
+	entry := s.GetEntry(databaseID, entryID)
+	if entry == nil || lastModified.After(entry.LastModified) {
+		return nil
+	}
+	return entry.Children
 }
 
 // DetectDeletedResources finds resources in state that are no longer in Notion.

@@ -51,6 +51,9 @@ type syncContext struct {
 	configuredRoots map[string]bool
 	// paths hands out collision-free vault paths keyed by Notion ID.
 	paths *sync.PathAllocator
+	// lastEdited maps page IDs to last_edited_time from one search sweep,
+	// saving a GetPage call per page for the unchanged check.
+	lastEdited map[string]time.Time
 }
 
 var syncCmd = &cobra.Command{
@@ -183,13 +186,22 @@ func runSync(cmd *cobra.Command, args []string) error {
 	// Build list of roots to process
 	roots := cfg.Sync.Roots
 
+	// One sweep yields every page's last_edited_time, and the workspace
+	// roots too when discovery is on.
+	logger.Info("searching workspace pages")
+	searchedPages, err := searchPages(ctx, client, cfg.Sync.DiscoverWorkspaceRoots, logger)
+	if err != nil {
+		return fmt.Errorf("searching workspace pages: %w", err)
+	}
+
 	// Discover workspace roots if enabled
 	if cfg.Sync.DiscoverWorkspaceRoots {
 		logger.Info("discovering workspace roots")
-		discovered, err := client.DiscoverWorkspaceRoots(ctx)
+		databases, err := client.SearchAll(ctx, "database")
 		if err != nil {
 			return fmt.Errorf("discovering workspace roots: %w", err)
 		}
+		discovered := notion.WorkspaceRoots(searchedPages, databases)
 		logger.Info("discovered workspace roots", "count", len(discovered))
 
 		// The search API's order varies; within a run the first claim on
@@ -232,6 +244,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 		visited:          make(map[string]bool),
 		configuredRoots:  configuredRootIDs(cfg.Sync.Roots),
 		paths:            sync.NewPathAllocator(state),
+		lastEdited:       notion.LastEditedTimes(searchedPages),
 	}
 
 	// Attachments are written before each checkpoint so the state never
@@ -278,10 +291,22 @@ func runSync(cmd *cobra.Command, args []string) error {
 		tuiRunner.Done(syncErr)
 		tuiRunner.Wait()
 	} else {
-		logger.Info("sync complete")
+		logger.Info("sync complete", "api_requests", client.RequestCount())
 	}
 
 	return syncErr
+}
+
+// searchPages returns every page search finds. Without discovery the
+// sweep only saves GetPage calls, so a failure falls back to them rather
+// than aborting the run.
+func searchPages(ctx context.Context, client *notion.Client, discover bool, logger *slog.Logger) ([]notionapi.Object, error) {
+	pages, err := client.SearchAll(ctx, "page")
+	if err == nil || discover {
+		return pages, err
+	}
+	logger.Warn("searching workspace pages failed, checking each page instead", "error", err)
+	return nil, nil
 }
 
 // configuredRootIDs returns the IDs of the roots listed in the config.
@@ -405,17 +430,17 @@ func syncPageRecursive(sc *syncContext, resource *notion.Resource, folderPath st
 		sc.tuiRunner.SetSyncing(resource.ID)
 	}
 
-	// Fetch page metadata to get LastEditedTime
-	page, err := sc.client.GetPage(sc.ctx, resource.ID)
-	if err != nil {
-		return fmt.Errorf("fetching page: %w", err)
+	lastModified := resource.LastEditedTime
+	if lastModified.IsZero() {
+		var err error
+		if lastModified, err = sc.pageLastEdited(resource.ID); err != nil {
+			return fmt.Errorf("fetching page: %w", err)
+		}
 	}
 
-	lastModified := page.LastEditedTime
-
-	// Check if sync is needed
-	if !sc.state.NeedsSync(resource.ID, lastModified) {
+	if cached := sc.state.UnchangedChildren(resource.ID, lastModified); cached != nil {
 		sc.logger.Info("page unchanged, skipping", "title", resource.Title)
+		syncChildren(sc, resource, fromRefs(cached.Pages), fromRefs(cached.Databases), folderPath, visited)
 		if sc.tuiRunner != nil {
 			sc.tuiRunner.SetDone(resource.ID)
 		}
@@ -427,51 +452,45 @@ func syncPageRecursive(sc *syncContext, resource *notion.Resource, folderPath st
 	if err != nil {
 		return fmt.Errorf("fetching page blocks: %w", err)
 	}
+	return syncPageWithBlocks(sc, resource, blocks, lastModified, folderPath, visited)
+}
 
+// pageLastEdited returns a page's last_edited_time from the search sweep,
+// or from the page itself when search didn't return it.
+func (sc *syncContext) pageLastEdited(id string) (time.Time, error) {
+	if t, ok := sc.lastEdited[id]; ok {
+		return t, nil
+	}
+	page, err := sc.client.GetPage(sc.ctx, id)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return page.LastEditedTime, nil
+}
+
+// syncPageWithBlocks writes a page from its fetched blocks, then syncs
+// its child pages and databases.
+func syncPageWithBlocks(sc *syncContext, resource *notion.Resource, blocks []notionapi.Block, lastModified time.Time, folderPath string, visited map[string]bool) error {
 	fetcher := newBlockCache(sc.client)
+	childPages, childDatabases, children := scanChildren(sc, resource, blocks, fetcher)
 	if sc.dryRun {
 		localPath := sc.allocatePage(resource.ID, folderPath, resource.Title)
 		sc.logger.Info("would sync page", "title", resource.Title, "blocks", len(blocks), "path", localPath)
 	} else {
-		localPath, err := writePage(sc, resource, folderPath, blocks, fetcher, lastModified)
+		localPath, err := writePage(sc, resource, folderPath, blocks, fetcher, lastModified, children)
 		if err != nil {
 			return err
 		}
 		sc.logger.Info("synced page", "title", resource.Title, "file", localPath)
 	}
 
-	syncNestedChildren(sc, resource, blocks, fetcher, folderPath, visited)
-	return nil
-}
-
-// processChildPageWithBlocks processes a child page with pre-fetched blocks.
-// It writes the markdown file and recursively processes grandchildren.
-func processChildPageWithBlocks(sc *syncContext, resource *notion.Resource, blocks []notionapi.Block, lastModified time.Time, folderPath string, visited map[string]bool) error {
-	// Check if sync is needed
-	if !sc.state.NeedsSync(resource.ID, lastModified) {
-		sc.logger.Info("child page unchanged, skipping", "title", resource.Title)
-		return nil
-	}
-
-	fetcher := newBlockCache(sc.client)
-	if sc.dryRun {
-		localPath := sc.allocatePage(resource.ID, folderPath, resource.Title)
-		sc.logger.Info("would sync child page", "title", resource.Title, "blocks", len(blocks), "path", localPath)
-	} else {
-		localPath, err := writePage(sc, resource, folderPath, blocks, fetcher, lastModified)
-		if err != nil {
-			return err
-		}
-		sc.logger.Info("synced child page", "title", resource.Title, "file", localPath)
-	}
-
-	syncNestedChildren(sc, resource, blocks, fetcher, folderPath, visited)
+	syncChildren(sc, resource, childPages, childDatabases, folderPath, visited)
 	return nil
 }
 
 // writePage renders a page, writes it with its notion-id frontmatter and
-// records it in state, returning the path written.
-func writePage(sc *syncContext, resource *notion.Resource, folderPath string, blocks []notionapi.Block, fetcher transform.BlockFetcher, lastModified time.Time) (string, error) {
+// records it in state with its children, returning the path written.
+func writePage(sc *syncContext, resource *notion.Resource, folderPath string, blocks []notionapi.Block, fetcher transform.BlockFetcher, lastModified time.Time, children *sync.Children) (string, error) {
 	markdown, err := sc.newTransformer(fetcher, folderPath).BlocksToMarkdown(blocks)
 	if err != nil {
 		return "", fmt.Errorf("transforming blocks: %w", err)
@@ -496,6 +515,7 @@ func writePage(sc *syncContext, resource *notion.Resource, folderPath string, bl
 		Title:        resource.Title,
 		LastModified: lastModified,
 		LocalPath:    localPath,
+		Children:     children,
 	})
 
 	// Update timestamp in Notion
@@ -634,8 +654,28 @@ func syncChildPages(sc *syncContext, parent *notion.Resource, childPages []child
 		return
 	}
 
-	// Fetch child page data (metadata + blocks) in parallel
-	results := sc.workerPool.FetchPagesWithBlocksParallel(sc.ctx, childIDs)
+	lastModified := make(map[string]time.Time, len(childIDs))
+	cached := make(map[string]*sync.Children)
+	var toFetch []string
+	for _, id := range childIDs {
+		t, err := sc.pageLastEdited(id)
+		if err != nil {
+			sc.logger.Error("failed to fetch child page", "id", id, "error", err)
+			if sc.tuiRunner != nil {
+				sc.tuiRunner.SetError(id, err.Error())
+			}
+			continue
+		}
+		lastModified[id] = t
+		if children := sc.state.UnchangedChildren(id, t); children != nil {
+			cached[id] = children
+			continue
+		}
+		toFetch = append(toFetch, id)
+	}
+
+	// Fetch changed child pages' blocks in parallel
+	results := sc.workerPool.FetchBlocksParallel(sc.ctx, toFetch)
 	for result := range results {
 		child := childMap[result.PageID]
 
@@ -657,13 +697,28 @@ func syncChildPages(sc *syncContext, parent *notion.Resource, childPages []child
 		}
 
 		// Recursively process the child
-		if err := processChildPageWithBlocks(sc, childResource, result.Blocks, result.Page.LastEditedTime, childFolder, visited); err != nil {
+		if err := syncPageWithBlocks(sc, childResource, result.Blocks, lastModified[result.PageID], childFolder, visited); err != nil {
 			sc.logger.Error("failed to sync child page", "parent", parent.Title, "child", child.title, "error", err)
 			if sc.tuiRunner != nil {
 				sc.tuiRunner.SetError(result.PageID, err.Error())
 			}
 		} else if sc.tuiRunner != nil {
 			sc.tuiRunner.SetDone(result.PageID)
+		}
+	}
+
+	for _, id := range childIDs {
+		children, ok := cached[id]
+		// A changed sibling's subtree may have reached it already.
+		if !ok || visited[id] {
+			continue
+		}
+		visited[id] = true
+		childResource := &notion.Resource{ID: id, Type: notion.ResourceTypePage, Title: childMap[id].title}
+		sc.logger.Info("child page unchanged, skipping", "title", childResource.Title)
+		syncChildren(sc, childResource, fromRefs(children.Pages), fromRefs(children.Databases), childFolder, visited)
+		if sc.tuiRunner != nil {
+			sc.tuiRunner.SetDone(id)
 		}
 	}
 }
@@ -747,19 +802,60 @@ func collectChildren(ctx context.Context, fetcher transform.BlockFetcher, blocks
 	return pages, databases, errors.Join(errs...)
 }
 
-// syncNestedChildren syncs every child page and child database found in
-// a page's block tree.
-func syncNestedChildren(sc *syncContext, parent *notion.Resource, blocks []notionapi.Block, fetcher transform.BlockFetcher, folderPath string, visited map[string]bool) {
-	childPages, childDatabases, err := collectChildren(sc.ctx, fetcher, blocks)
+// scanChildren returns the child pages and child databases found in a
+// page's block tree, and the record of them to cache in state. The record
+// is nil when a fetch failed in a way a retry might fix, so the next run
+// fetches the page's blocks again rather than trusting a partial list.
+func scanChildren(sc *syncContext, parent *notion.Resource, blocks []notionapi.Block, fetcher transform.BlockFetcher) (pages, databases []childPageInfo, children *sync.Children) {
+	pages, databases, err := collectChildren(sc.ctx, fetcher, blocks)
 	if err != nil {
 		// Still sync the children that could be found.
 		sc.logger.Error("failed to scan nested blocks for children", "parent", parent.Title, "error", err)
+		if !allInaccessible(err) {
+			return pages, databases, nil
+		}
 	}
+	return pages, databases, &sync.Children{Pages: toRefs(pages), Databases: toRefs(databases)}
+}
+
+// allInaccessible reports whether every error joined in err is a 404 or
+// 403, such as a synced block whose original isn't shared; retrying
+// won't find more children.
+func allInaccessible(err error) bool {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, e := range joined.Unwrap() {
+			if !allInaccessible(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return isInaccessibleError(err)
+}
+
+// syncChildren syncs a page's child pages and child databases.
+func syncChildren(sc *syncContext, parent *notion.Resource, childPages, childDatabases []childPageInfo, folderPath string, visited map[string]bool) {
 	if len(childPages) > 0 {
 		sc.logger.Debug("found child pages", "parent", parent.Title, "count", len(childPages), "folder", folderPath)
 		syncChildPages(sc, parent, childPages, folderPath, visited)
 	}
 	syncChildDatabases(sc, parent, childDatabases, syncDatabase)
+}
+
+func toRefs(children []childPageInfo) []sync.ChildRef {
+	refs := make([]sync.ChildRef, len(children))
+	for i, c := range children {
+		refs[i] = sync.ChildRef{ID: c.id, Title: c.title}
+	}
+	return refs
+}
+
+func fromRefs(refs []sync.ChildRef) []childPageInfo {
+	children := make([]childPageInfo, len(refs))
+	for i, r := range refs {
+		children[i] = childPageInfo{id: r.ID, title: r.Title}
+	}
+	return children
 }
 
 // databaseSyncFunc syncs a database; injected so tests can observe calls.
@@ -923,15 +1019,16 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 	pageMap := make(map[string]*notionapi.Page)
 	syncedCount := 0
 	skippedCount := 0
+	cached := make(map[string]*sync.Children)
 
 	for i := range pages {
 		page := &pages[i]
 		pageID := string(page.ID)
 		pageMap[pageID] = page
 
-		// Check if entry needs sync
-		if !sc.state.NeedsEntrySync(resource.ID, pageID, page.LastEditedTime) {
+		if children := sc.state.UnchangedEntryChildren(resource.ID, pageID, page.LastEditedTime); children != nil {
 			sc.logger.Debug("entry unchanged, skipping", "id", pageID)
+			cached[pageID] = children
 			skippedCount++
 			if sc.tuiRunner != nil {
 				sc.tuiRunner.SetDone(pageID)
@@ -966,8 +1063,10 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 			}
 
 			// Process the entry with pre-fetched blocks; the cache is per
-			// entry so the nested-children scan below reuses its fetches.
+			// entry so rendering reuses the nested-children scan's fetches.
+			entry := &notion.Resource{ID: pageID, Type: notion.ResourceTypePage, Title: notion.ExtractPageTitle(page)}
 			fetcher := newBlockCache(sc.client)
+			childPages, childDatabases, children := scanChildren(sc, entry, result.Blocks, fetcher)
 			transformer := sc.newTransformer(fetcher, folder)
 			var priorPath string
 			if prior := sc.state.GetEntry(resource.ID, pageID); prior != nil {
@@ -989,6 +1088,7 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 				Title:        notion.ExtractPageTitle(page),
 				LastModified: page.LastEditedTime,
 				LocalFile:    filename,
+				Children:     children,
 			})
 
 			// Update timestamp in Notion
@@ -998,9 +1098,20 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 				sc.tuiRunner.SetDone(pageID)
 			}
 
-			entry := &notion.Resource{ID: pageID, Type: notion.ResourceTypePage, Title: notion.ExtractPageTitle(page)}
-			syncNestedChildren(sc, entry, result.Blocks, fetcher, folder, sc.visited)
+			syncChildren(sc, entry, childPages, childDatabases, folder, sc.visited)
 		}
+	}
+
+	// Unchanged entries' bodies aren't refetched, but pages nested in
+	// them may have changed.
+	for i := range pages {
+		pageID := string(pages[i].ID)
+		children, ok := cached[pageID]
+		if !ok {
+			continue
+		}
+		entry := &notion.Resource{ID: pageID, Type: notion.ResourceTypePage, Title: notion.ExtractPageTitle(&pages[i])}
+		syncChildren(sc, entry, fromRefs(children.Pages), fromRefs(children.Databases), folder, sc.visited)
 	}
 
 	// Update database state with latest timestamp

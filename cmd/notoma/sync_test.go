@@ -275,6 +275,19 @@ func TestSyncChildDatabases(t *testing.T) {
 	}
 }
 
+func TestAllInaccessible(t *testing.T) {
+	notFound := fmt.Errorf("fetching children of block b: %w", &notionapi.Error{Status: 404})
+	forbidden := &notionapi.Error{Status: 403}
+	timeout := errors.New("timeout")
+
+	if !allInaccessible(errors.Join(notFound, errors.Join(forbidden))) {
+		t.Error("nested 404 and 403 errors should count as inaccessible")
+	}
+	if allInaccessible(errors.Join(notFound, errors.Join(timeout))) {
+		t.Error("a retryable error nested among 404s should not")
+	}
+}
+
 func TestConfiguredRootIDs(t *testing.T) {
 	ids := configuredRootIDs([]config.Root{
 		{URL: "https://www.notion.so/myworkspace/Reading-List-def456789012345678901234567890ab?v=1"},

@@ -67,7 +67,7 @@ func TestWritePage_RenameRemovesOldFile(t *testing.T) {
 	writeVaultFile(t, vault, "Old Title.md", transform.PageFrontmatter(id)+"\nold\n")
 
 	resource := &notion.Resource{ID: id, Type: notion.ResourceTypePage, Title: "New Title"}
-	got, err := writePage(sc, resource, "", []notionapi.Block{paragraph("p")}, nil, time.Now())
+	got, err := writePage(sc, resource, "", []notionapi.Block{paragraph("p")}, nil, time.Now(), nil)
 	if err != nil {
 		t.Fatalf("writePage() error = %v", err)
 	}
@@ -96,7 +96,7 @@ func TestWritePage_KeepsOldPathOwnedByAnotherPage(t *testing.T) {
 	writeVaultFile(t, vault, "Untracked.md", "no frontmatter\n")
 
 	resource := &notion.Resource{ID: id, Type: notion.ResourceTypePage, Title: "New Title"}
-	if _, err := writePage(sc, resource, "", nil, nil, time.Now()); err != nil {
+	if _, err := writePage(sc, resource, "", nil, nil, time.Now(), nil); err != nil {
 		t.Fatalf("writePage() error = %v", err)
 	}
 	if got := readVaultFile(t, vault, "Old Title.md"); got != foreign {
@@ -116,7 +116,7 @@ func TestWritePage_CaseOnlyRenameChangesName(t *testing.T) {
 	sc, vault := newPathsTestContext(t, state)
 	writeVaultFile(t, vault, "notes.md", transform.PageFrontmatter(id)+"\nold\n")
 
-	if _, err := writePage(sc, &notion.Resource{ID: id, Title: "Notes"}, "", nil, nil, time.Now()); err != nil {
+	if _, err := writePage(sc, &notion.Resource{ID: id, Title: "Notes"}, "", nil, nil, time.Now(), nil); err != nil {
 		t.Fatalf("writePage() error = %v", err)
 	}
 
