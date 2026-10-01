@@ -36,14 +36,22 @@ type Client struct {
 	logger  *slog.Logger
 }
 
+// apiRequestTimeout bounds each Notion API request. Without it a connection
+// stalled after a network drop hangs the sync indefinitely.
+const apiRequestTimeout = 60 * time.Second
+
 // NewClient creates a new Notion client with rate limiting.
 func NewClient(token string, logger *slog.Logger) *Client {
+	return newClient(token, logger, &http.Client{Timeout: apiRequestTimeout})
+}
+
+func newClient(token string, logger *slog.Logger, httpClient *http.Client) *Client {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	return &Client{
-		api:     notionapi.NewClient(notionapi.Token(token)),
+		api:     notionapi.NewClient(notionapi.Token(token), notionapi.WithHTTPClient(httpClient)),
 		limiter: DefaultRateLimiter(),
 		logger:  logger,
 	}
