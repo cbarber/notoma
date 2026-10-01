@@ -70,6 +70,9 @@ type SyncState struct {
 	ConfigHash   string                      `json:"config_hash,omitempty"`
 	Resources    map[string]ResourceState    `json:"resources"`
 	Attachments  map[string]*AttachmentState `json:"attachments,omitempty"`
+
+	// onChange runs after each recorded resource or entry; see OnChange.
+	onChange func()
 }
 
 // StateVersion is the current schema version for the state file.
@@ -177,6 +180,7 @@ func (s *SyncState) SetResource(res ResourceState) {
 		s.Resources = make(map[string]ResourceState)
 	}
 	s.Resources[res.ID] = res
+	s.notifyChange()
 }
 
 // RemoveResource removes a resource from the state.
@@ -213,7 +217,20 @@ func (s *SyncState) SetEntry(databaseID string, entry EntryState) error {
 	}
 	res.Entries[entry.PageID] = entry
 	s.Resources[databaseID] = *res
+	s.notifyChange()
 	return nil
+}
+
+// OnChange registers f to run after every SetResource and SetEntry call,
+// so callers can checkpoint progress without hooking each sync code path.
+func (s *SyncState) OnChange(f func()) {
+	s.onChange = f
+}
+
+func (s *SyncState) notifyChange() {
+	if s.onChange != nil {
+		s.onChange()
+	}
 }
 
 // RemoveEntry removes an entry from a database resource.
