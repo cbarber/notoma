@@ -224,9 +224,24 @@ func runSync(cmd *cobra.Command, args []string) error {
 		configuredRoots:  configuredRootIDs(cfg.Sync.Roots),
 	}
 
+	// Attachments are written before each checkpoint so the state never
+	// records a page as synced while its attachments exist only in memory.
+	written := make(map[string]bool)
+	var flushAttachments func()
+	if attDownloader != nil {
+		flushAttachments = func() {
+			writeAttachments(ctx, attDownloader, w, state, written, logger)
+		}
+	}
+	checkpointer := sync.NewCheckpointer(ctx, cfg.State.File, state, sync.CheckpointInterval, dryRun, flushAttachments, logger)
+	state.OnChange(checkpointer.Record)
+
 	// Process each root
 	var syncErr error
 	for _, root := range roots {
+		if ctx.Err() != nil {
+			break
+		}
 		if err := processRoot(sc, root); err != nil {
 			logger.Error("failed to process root", "url", root.URL, "error", err)
 			syncErr = err
@@ -234,36 +249,18 @@ func runSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Write downloaded attachments to disk
-	if attDownloader != nil && !dryRun {
-		downloaded := attDownloader.GetDownloaded()
-		for url, att := range downloaded {
-			// Get attachment data and write it
-			data, err := attDownloader.GetData(ctx, url)
-			if err != nil {
-				logger.Error("failed to download attachment data", "url", url, "error", err)
-				continue
-			}
-			if _, err := w.WriteAttachment(att.LocalPath, data); err != nil {
-				logger.Error("failed to write attachment", "path", att.LocalPath, "error", err)
-				continue
-			}
-			// Update attachment state
-			state.UpdateAttachmentState(url, att.ContentHash, att.LocalPath, att.Size, "")
-		}
-		logger.Info("downloaded attachments", "count", len(downloaded))
+	if err := ctx.Err(); err != nil {
+		logger.Info("sync interrupted, saving progress")
+		syncErr = err
 	}
 
-	// Save state (unless dry-run)
-	if !dryRun {
-		if err := sync.SaveState(cfg.State.File, state); err != nil {
-			logger.Error("failed to save state", "error", err)
-			if syncErr == nil {
-				syncErr = err
-			}
-		} else {
-			logger.Info("saved sync state", "path", cfg.State.File)
+	if err := checkpointer.Save(); err != nil {
+		logger.Error("failed to save state", "error", err)
+		if syncErr == nil {
+			syncErr = err
 		}
+	} else if !dryRun {
+		logger.Info("saved sync state", "path", cfg.State.File)
 	}
 
 	// Signal completion to TUI
@@ -289,6 +286,36 @@ func configuredRootIDs(roots []config.Root) map[string]bool {
 		ids[parsed.ID] = true
 	}
 	return ids
+}
+
+// writeAttachments writes attachments downloaded since the last call and
+// records them in state. written tracks URLs already handled this run.
+func writeAttachments(ctx context.Context, d *transform.AttachmentDownloader, w *writer.Writer, state *sync.SyncState, written map[string]bool, logger *slog.Logger) {
+	// Ignore cancellation: after Ctrl-C the pages referencing these
+	// attachments are saved as synced, so a skipped fetch is never retried.
+	// The HTTP client's timeout still bounds each download.
+	ctx = context.WithoutCancel(ctx)
+	count := 0
+	for url, att := range d.GetDownloaded() {
+		if written[url] {
+			continue
+		}
+		data, err := d.GetData(ctx, url)
+		if err != nil {
+			logger.Error("failed to download attachment data", "url", url, "error", err)
+			continue
+		}
+		if _, err := w.WriteAttachment(att.LocalPath, data); err != nil {
+			logger.Error("failed to write attachment", "path", att.LocalPath, "error", err)
+			continue
+		}
+		written[url] = true
+		state.UpdateAttachmentState(url, att.ContentHash, att.LocalPath, att.Size, "")
+		count++
+	}
+	if count > 0 {
+		logger.Info("downloaded attachments", "count", count)
+	}
 }
 
 func processRoot(sc *syncContext, root config.Root) error {
