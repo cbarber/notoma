@@ -26,6 +26,11 @@ type fakePage struct {
 	text     string
 	children []string
 	edited   time.Time
+	archived bool
+	// databases lists child database IDs in the page's blocks.
+	databases []string
+	// toggle, if set, adds a toggle block with that ID and children.
+	toggle string
 }
 
 // fakeNotion serves pages, blocks and one database from memory and records
@@ -37,10 +42,16 @@ type fakeNotion struct {
 	requests []string
 	// searchFails makes search return a 500.
 	searchFails bool
+	// failBlocks makes fetching these blocks' children return a 500.
+	failBlocks map[string]bool
+	// dbGone makes the database return a 404, dbFails a 500.
+	dbGone, dbFails bool
+	// failPages makes fetching these pages return a 500.
+	failPages map[string]bool
 }
 
 func newFakeNotion() *fakeNotion {
-	return &fakeNotion{pages: map[string]*fakePage{}}
+	return &fakeNotion{pages: map[string]*fakePage{}, failBlocks: map[string]bool{}, failPages: map[string]bool{}}
 }
 
 func (f *fakeNotion) add(id, title, text string, edited time.Time, children ...string) {
@@ -81,6 +92,7 @@ func (f *fakeNotion) pageJSON(id string) map[string]any {
 		"object":           "page",
 		"id":               id,
 		"last_edited_time": p.edited.Format(time.RFC3339),
+		"archived":         p.archived,
 		"properties": map[string]any{
 			"Name": map[string]any{"id": "title", "type": "title", "title": richText(p.title)},
 		},
@@ -118,9 +130,13 @@ func (f *fakeNotion) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		body = map[string]any{"object": "list", "results": []any{}, "has_more": false}
 	case "blocks":
+		if f.failBlocks[id] {
+			serverError(w)
+			return
+		}
 		p, ok := f.pages[id]
 		if !ok {
-			http.NotFound(w, r)
+			notFound(w)
 			return
 		}
 		blocks := []map[string]any{{
@@ -133,10 +149,46 @@ func (f *fakeNotion) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"child_page": map[string]any{"title": f.pages[child].title},
 			})
 		}
+		for _, db := range p.databases {
+			blocks = append(blocks, map[string]any{
+				"object": "block", "id": db, "type": "child_database",
+				"child_database": map[string]any{"title": "Tasks"},
+			})
+		}
+		if p.toggle != "" {
+			blocks = append(blocks, map[string]any{
+				"object": "block", "id": p.toggle, "type": "toggle", "has_children": true,
+				"toggle": map[string]any{"rich_text": richText("more")},
+			})
+		}
 		body = map[string]any{"object": "list", "results": blocks, "has_more": false}
 	case "page":
+		if f.failPages[id] {
+			serverError(w)
+			return
+		}
+		if f.pages[id] == nil {
+			notFound(w)
+			return
+		}
 		body = f.pageJSON(id)
-	case "database":
+	case "database", "query":
+		if f.dbGone {
+			notFound(w)
+			return
+		}
+		if f.dbFails {
+			serverError(w)
+			return
+		}
+		if kind == "query" {
+			var rows []map[string]any
+			for _, row := range f.rows {
+				rows = append(rows, f.pageJSON(row))
+			}
+			body = map[string]any{"object": "list", "results": rows, "has_more": false}
+			break
+		}
 		body = map[string]any{
 			"object": "database", "id": id, "title": richText("Tasks"),
 			"last_edited_time": "2025-01-01T00:00:00Z",
@@ -144,12 +196,6 @@ func (f *fakeNotion) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"Name": map[string]any{"id": "title", "name": "Name", "type": "title", "title": map[string]any{}},
 			},
 		}
-	case "query":
-		var rows []map[string]any
-		for _, row := range f.rows {
-			rows = append(rows, f.pageJSON(row))
-		}
-		body = map[string]any{"object": "list", "results": rows, "has_more": false}
 	default:
 		http.NotFound(w, r)
 		return
@@ -158,11 +204,24 @@ func (f *fakeNotion) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// lastEdited returns the search sweep's view of the fake workspace.
+func serverError(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusInternalServerError)
+	_, _ = w.Write([]byte(`{"object":"error","status":500,"code":"internal_server_error","message":"boom"}`))
+}
+
+func notFound(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = w.Write([]byte(`{"object":"error","status":404,"code":"object_not_found","message":"gone"}`))
+}
+
+// lastEdited returns the search sweep's view of the fake workspace, which
+// like Notion's leaves out trashed pages.
 func (f *fakeNotion) lastEdited() map[string]time.Time {
 	times := map[string]time.Time{}
 	for id, p := range f.pages {
-		times[id] = p.edited
+		if !p.archived {
+			times[id] = p.edited
+		}
 	}
 	return times
 }
@@ -199,6 +258,10 @@ func fakeSyncContext(t *testing.T, fake *fakeNotion, state *sync.SyncState, vaul
 		configuredRoots:  map[string]bool{root: true},
 		paths:            sync.NewPathAllocator(state),
 		lastEdited:       fake.lastEdited(),
+		reached:          map[string]bool{},
+		reachedEntries:   map[string]map[string]bool{},
+		tracked:          state.ResourceCount() + state.EntryCount(),
+		rootIDs:          map[string]bool{root: true},
 	}
 }
 

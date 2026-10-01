@@ -90,6 +90,9 @@ type SyncState struct {
 	ConfigHash   string                      `json:"config_hash,omitempty"`
 	Resources    map[string]ResourceState    `json:"resources"`
 	Attachments  map[string]*AttachmentState `json:"attachments,omitempty"`
+	// Roots lists the root IDs processed by the last run that could delete
+	// removed pages; a root missing later blocks deletion.
+	Roots []string `json:"roots,omitempty"`
 
 	// onChange runs after each recorded resource or entry; see OnChange.
 	onChange func()

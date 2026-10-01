@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +29,7 @@ import (
 var (
 	dryRun bool
 	force  bool
+	prune  bool
 	quiet  bool // quiet disables TUI and shows plain log output
 )
 
@@ -54,6 +56,41 @@ type syncContext struct {
 	// lastEdited maps page IDs to last_edited_time from one search sweep,
 	// saving a GetPage call per page for the unchanged check.
 	lastEdited map[string]time.Time
+	// archived holds the IDs search reported as archived or in the trash.
+	archived map[string]bool
+	// reached holds the pages and databases this run confirmed still exist
+	// in Notion; reachedEntries holds each fully queried database's rows.
+	// Whatever else the state tracks is removed after the walk.
+	reached        map[string]bool
+	reachedEntries map[string]map[string]bool
+	// incomplete says why the walk may have missed resources that still
+	// exist; deletion is skipped when it is set.
+	incomplete string
+	// tracked counts the resources and entries in state before the walk,
+	// so pages added this run don't loosen the deletion cap.
+	tracked int
+	// rootIDs holds every root processed this run.
+	rootIDs map[string]bool
+	// prune allows deletion even when a root from an earlier run is missing.
+	prune bool
+}
+
+// errRemoved reports a page or database in the trash. Notion still serves
+// these, so they would otherwise look reachable.
+var errRemoved = errors.New("archived or in trash")
+
+// isRemoved reports whether err means the resource is gone or no longer
+// shared, rather than that fetching it failed.
+func isRemoved(err error) bool {
+	return errors.Is(err, errRemoved) || isInaccessibleError(err)
+}
+
+// markIncomplete records that the walk may have missed resources, keeping
+// the first reason for the log.
+func (sc *syncContext) markIncomplete(reason string) {
+	if sc.incomplete == "" {
+		sc.incomplete = reason
+	}
 }
 
 var syncCmd = &cobra.Command{
@@ -75,6 +112,7 @@ func init() {
 	syncCmd.Flags().StringVarP(&configPath, "config", "c", "config.yaml", "path to config file")
 	syncCmd.Flags().BoolVarP(&dryRun, "dry-run", "n", false, "preview changes without writing files")
 	syncCmd.Flags().BoolVarP(&force, "force", "f", false, "ignore state and perform full resync")
+	syncCmd.Flags().BoolVar(&prune, "prune", false, "remove deleted pages even if a root synced before is missing from this run")
 	syncCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "enable verbose logging")
 	syncCmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "disable TUI, use plain log output")
 }
@@ -245,6 +283,12 @@ func runSync(cmd *cobra.Command, args []string) error {
 		configuredRoots:  configuredRootIDs(cfg.Sync.Roots),
 		paths:            sync.NewPathAllocator(state),
 		lastEdited:       notion.LastEditedTimes(searchedPages),
+		archived:         notion.ArchivedIDs(searchedPages),
+		reached:          make(map[string]bool),
+		reachedEntries:   make(map[string]map[string]bool),
+		tracked:          state.ResourceCount() + state.EntryCount(),
+		rootIDs:          configuredRootIDs(roots),
+		prune:            prune,
 	}
 
 	// Attachments are written before each checkpoint so the state never
@@ -276,6 +320,9 @@ func runSync(cmd *cobra.Command, args []string) error {
 		logger.Info("sync interrupted, saving progress")
 		syncErr = err
 	}
+
+	// Deletion runs before the final save so state and disk agree.
+	removeIfComplete(sc, syncErr)
 
 	if err := checkpointer.Save(); err != nil {
 		logger.Error("failed to save state", "error", err)
@@ -377,6 +424,10 @@ func processRoot(sc *syncContext, root config.Root) error {
 		"title", resource.Title,
 		"id", resource.ID,
 	)
+	if resource.Archived {
+		sc.logger.Warn("root is in the trash, treating it as removed", "title", resource.Title)
+		return nil
+	}
 
 	// Add to TUI if available (starts as pending, worker pool OnStart marks as syncing)
 	if sc.tuiRunner != nil {
@@ -437,6 +488,7 @@ func syncPageRecursive(sc *syncContext, resource *notion.Resource, folderPath st
 			return fmt.Errorf("fetching page: %w", err)
 		}
 	}
+	sc.reached[resource.ID] = true
 
 	if cached := sc.state.UnchangedChildren(resource.ID, lastModified); cached != nil {
 		sc.logger.Info("page unchanged, skipping", "title", resource.Title)
@@ -456,14 +508,18 @@ func syncPageRecursive(sc *syncContext, resource *notion.Resource, folderPath st
 }
 
 // pageLastEdited returns a page's last_edited_time from the search sweep,
-// or from the page itself when search didn't return it.
+// or from the page itself when search didn't return it. A page search
+// calls archived is checked too, since search lags behind a restore.
 func (sc *syncContext) pageLastEdited(id string) (time.Time, error) {
-	if t, ok := sc.lastEdited[id]; ok {
+	if t, ok := sc.lastEdited[id]; ok && !sc.archived[id] {
 		return t, nil
 	}
 	page, err := sc.client.GetPage(sc.ctx, id)
 	if err != nil {
 		return time.Time{}, err
+	}
+	if page.Archived {
+		return time.Time{}, errRemoved
 	}
 	return page.LastEditedTime, nil
 }
@@ -659,13 +715,22 @@ func syncChildPages(sc *syncContext, parent *notion.Resource, childPages []child
 	var toFetch []string
 	for _, id := range childIDs {
 		t, err := sc.pageLastEdited(id)
+		if isRemoved(err) {
+			sc.logger.Debug("child page removed from Notion", "id", id, "error", err)
+			if sc.tuiRunner != nil {
+				sc.tuiRunner.SetDone(id)
+			}
+			continue
+		}
 		if err != nil {
 			sc.logger.Error("failed to fetch child page", "id", id, "error", err)
+			sc.markIncomplete("fetching child page " + id + " failed")
 			if sc.tuiRunner != nil {
 				sc.tuiRunner.SetError(id, err.Error())
 			}
 			continue
 		}
+		sc.reached[id] = true
 		lastModified[id] = t
 		if children := sc.state.UnchangedChildren(id, t); children != nil {
 			cached[id] = children
@@ -679,8 +744,14 @@ func syncChildPages(sc *syncContext, parent *notion.Resource, childPages []child
 	for result := range results {
 		child := childMap[result.PageID]
 
+		if isRemoved(result.Err) {
+			sc.logger.Debug("child page removed from Notion", "id", result.PageID, "error", result.Err)
+			delete(sc.reached, result.PageID)
+			continue
+		}
 		if result.Err != nil {
 			sc.logger.Error("failed to fetch child page", "id", result.PageID, "error", result.Err)
+			sc.markIncomplete("fetching child page " + result.PageID + " failed")
 			if sc.tuiRunner != nil {
 				sc.tuiRunner.SetError(result.PageID, result.Err.Error())
 			}
@@ -699,6 +770,7 @@ func syncChildPages(sc *syncContext, parent *notion.Resource, childPages []child
 		// Recursively process the child
 		if err := syncPageWithBlocks(sc, childResource, result.Blocks, lastModified[result.PageID], childFolder, visited); err != nil {
 			sc.logger.Error("failed to sync child page", "parent", parent.Title, "child", child.title, "error", err)
+			sc.markIncomplete("syncing child page " + result.PageID + " failed")
 			if sc.tuiRunner != nil {
 				sc.tuiRunner.SetError(result.PageID, err.Error())
 			}
@@ -812,6 +884,7 @@ func scanChildren(sc *syncContext, parent *notion.Resource, blocks []notionapi.B
 		// Still sync the children that could be found.
 		sc.logger.Error("failed to scan nested blocks for children", "parent", parent.Title, "error", err)
 		if !allInaccessible(err) {
+			sc.markIncomplete("scanning the blocks of " + parent.ID + " failed")
 			return pages, databases, nil
 		}
 	}
@@ -889,7 +962,7 @@ func syncChildDatabases(sc *syncContext, parent *notion.Resource, childDatabases
 
 		// Linked database views of databases the integration can't access
 		// come back as 404/403; they aren't syncable, so they aren't errors.
-		if isInaccessibleError(err) {
+		if isRemoved(err) {
 			sc.logger.Debug("skipping inaccessible child database", "parent", parent.Title, "database", child.title, "error", err)
 			if sc.tuiRunner != nil {
 				sc.tuiRunner.SetDone(child.id)
@@ -897,6 +970,7 @@ func syncChildDatabases(sc *syncContext, parent *notion.Resource, childDatabases
 			continue
 		}
 		sc.logger.Error("failed to sync child database", "parent", parent.Title, "database", child.title, "error", err)
+		sc.markIncomplete("syncing child database " + child.id + " failed")
 		if sc.tuiRunner != nil {
 			sc.tuiRunner.SetError(child.id, err.Error())
 		}
@@ -930,6 +1004,10 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 	if err != nil {
 		return fmt.Errorf("fetching database: %w", err)
 	}
+	if db.Archived {
+		return fmt.Errorf("fetching database: %w", errRemoved)
+	}
+	sc.reached[resource.ID] = true
 
 	schema, err := transform.ParseDatabaseSchema(db)
 	if err != nil {
@@ -948,6 +1026,12 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 	if err != nil {
 		return fmt.Errorf("querying database: %w", err)
 	}
+	pages = slices.DeleteFunc(pages, func(p notionapi.Page) bool { return p.Archived })
+	rows := make(map[string]bool, len(pages))
+	for _, page := range pages {
+		rows[string(page.ID)] = true
+	}
+	sc.reachedEntries[resource.ID] = rows
 
 	// Initialize or get database state
 	dbState := sc.state.GetResource(resource.ID)
@@ -992,6 +1076,18 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 				break
 			}
 			sc.logger.Info("  entry", "title", notion.ExtractPageTitle(&page))
+		}
+		// Walk what is known of the rows' children so the removal preview
+		// doesn't list pages nested in them.
+		for i := range pages {
+			pageID := string(pages[i].ID)
+			children := sc.state.UnchangedEntryChildren(resource.ID, pageID, pages[i].LastEditedTime)
+			if children == nil {
+				sc.markIncomplete("dry run does not fetch changed database entries")
+				continue
+			}
+			entry := &notion.Resource{ID: pageID, Type: notion.ResourceTypePage, Title: notion.ExtractPageTitle(&pages[i])}
+			syncChildren(sc, entry, fromRefs(children.Pages), fromRefs(children.Databases), folder, sc.visited)
 		}
 		return nil
 	}
@@ -1054,8 +1150,14 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 			page := pageMap[result.PageID]
 			pageID := result.PageID
 
+			if isRemoved(result.Err) {
+				sc.logger.Debug("entry removed from Notion", "id", pageID, "error", result.Err)
+				delete(rows, pageID)
+				continue
+			}
 			if result.Err != nil {
 				sc.logger.Error("failed to fetch blocks", "id", pageID, "error", result.Err)
+				sc.markIncomplete("fetching entry " + pageID + " failed")
 				if sc.tuiRunner != nil {
 					sc.tuiRunner.SetError(pageID, result.Err.Error())
 				}
@@ -1075,6 +1177,7 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 			filename, err := syncDatabaseEntryWithBlocks(sc, transformer, page, result.Blocks, schema, folder, priorPath)
 			if err != nil {
 				sc.logger.Error("failed to sync entry", "id", pageID, "error", err)
+				sc.markIncomplete("syncing entry " + pageID + " failed")
 				if sc.tuiRunner != nil {
 					sc.tuiRunner.SetError(pageID, err.Error())
 				}

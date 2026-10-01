@@ -28,6 +28,9 @@ type Resource struct {
 	Title          string
 	Icon           string // Emoji icon if set
 	LastEditedTime time.Time
+	// Archived is true for a resource in the trash, which Notion still
+	// serves.
+	Archived bool
 }
 
 // Client wraps the Notion API client with rate limiting and convenience methods.
@@ -103,6 +106,7 @@ func (c *Client) DetectResourceType(ctx context.Context, id string) (*Resource, 
 			Title:          ExtractPageTitle(page),
 			Icon:           ExtractPageIcon(page),
 			LastEditedTime: time.Time(page.LastEditedTime),
+			Archived:       page.Archived,
 		}, nil
 	}
 
@@ -120,6 +124,7 @@ func (c *Client) DetectResourceType(ctx context.Context, id string) (*Resource, 
 			Title:          extractDatabaseTitle(db),
 			Icon:           ExtractDatabaseIcon(db),
 			LastEditedTime: time.Time(db.LastEditedTime),
+			Archived:       db.Archived,
 		}, nil
 	}
 
@@ -342,6 +347,18 @@ func LastEditedTimes(pages []notionapi.Object) map[string]time.Time {
 		}
 	}
 	return times
+}
+
+// ArchivedIDs returns the IDs of the pages among search results that are
+// archived or in the trash.
+func ArchivedIDs(pages []notionapi.Object) map[string]bool {
+	ids := make(map[string]bool)
+	for _, obj := range pages {
+		if page, ok := obj.(*notionapi.Page); ok && page.Archived {
+			ids[string(page.ID)] = true
+		}
+	}
+	return ids
 }
 
 // handleError processes API errors and handles rate limiting.

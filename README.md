@@ -103,6 +103,9 @@ options:
 # Force full resync (ignore state)
 ./notoma sync --config config.yaml --force
 
+# Remove deleted pages even though a root synced before is missing
+./notoma sync --config config.yaml --prune
+
 # Show version
 ./notoma version
 ```
@@ -139,6 +142,19 @@ When a page is renamed in Notion, its file is moved to the new name. Notoma dele
 **Pages inside unshared synced blocks:** a page nested in a synced block whose original isn't shared with the integration is not picked up, even after access is granted, until its parent page changes or you run `notoma sync --force`.
 
 **Upgrading from an earlier version:** run `notoma sync --force` once. Files written by earlier versions have no `notion-id` frontmatter (pages) or use the older `notion_id` key (database entries). Until a file is rewritten, a renamed page leaves its old file behind.
+
+## Removed Pages
+
+After a sync, notoma deletes the files of pages, databases and database entries that it tracks but that are no longer in Notion. This covers anything deleted, moved to the trash, or no longer shared with the integration. A page that search reports as trashed is checked once more before deletion, since search can lag behind a restore. A removed database takes its entries and `.base` file with it, and its folder if nothing else is left in it. Attachments are kept.
+
+Deletion is skipped entirely, with a warning in the log, when:
+
+- a root failed, or the sync was interrupted;
+- the walk was incomplete: a page's blocks could not be fully read, or a page or database failed to fetch for any reason other than "not found";
+- a root synced in an earlier run is missing from this one, for example after removing it from the config or when discovery misses it. The warning names the missing roots. Run `notoma sync --prune` to delete its pages anyway;
+- more than 20% of the pages, databases and entries tracked before the run would be deleted, which usually means a token or sharing problem. This applies with `--prune` too.
+
+`--dry-run` logs what would be deleted without deleting anything. A file is only deleted if its `notion-id` matches the removed page; otherwise it is left in place. Its name is free for another page on the next run.
 
 ## Development
 
