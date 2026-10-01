@@ -65,11 +65,14 @@ func (p *WorkerPool) FetchBlocksParallel(ctx context.Context, pageIDs []string) 
 		defer close(results)
 
 		var wg sync.WaitGroup
+		// On cancel, break rather than return: wg.Wait must run before the
+		// deferred close, or in-flight workers send on a closed channel.
+	dispatch:
 		for _, pageID := range pageIDs {
 			// Check context before starting new work
 			select {
 			case <-ctx.Done():
-				return
+				break dispatch
 			default:
 			}
 
@@ -77,7 +80,7 @@ func (p *WorkerPool) FetchBlocksParallel(ctx context.Context, pageIDs []string) 
 			select {
 			case p.semaphore <- struct{}{}:
 			case <-ctx.Done():
-				return
+				break dispatch
 			}
 
 			wg.Add(1)
@@ -120,11 +123,14 @@ func (p *WorkerPool) FetchPagesParallel(ctx context.Context, pageIDs []string) <
 		defer close(results)
 
 		var wg sync.WaitGroup
+		// On cancel, break rather than return: wg.Wait must run before the
+		// deferred close, or in-flight workers send on a closed channel.
+	dispatch:
 		for _, pageID := range pageIDs {
 			// Check context before starting new work
 			select {
 			case <-ctx.Done():
-				return
+				break dispatch
 			default:
 			}
 
@@ -132,7 +138,7 @@ func (p *WorkerPool) FetchPagesParallel(ctx context.Context, pageIDs []string) <
 			select {
 			case p.semaphore <- struct{}{}:
 			case <-ctx.Done():
-				return
+				break dispatch
 			}
 
 			wg.Add(1)
@@ -176,11 +182,14 @@ func (p *WorkerPool) FetchPagesWithBlocksParallel(ctx context.Context, pageIDs [
 		defer close(results)
 
 		var wg sync.WaitGroup
+		// On cancel, break rather than return: wg.Wait must run before the
+		// deferred close, or in-flight workers send on a closed channel.
+	dispatch:
 		for _, pageID := range pageIDs {
 			// Check context before starting new work
 			select {
 			case <-ctx.Done():
-				return
+				break dispatch
 			default:
 			}
 
@@ -188,7 +197,7 @@ func (p *WorkerPool) FetchPagesWithBlocksParallel(ctx context.Context, pageIDs [
 			select {
 			case p.semaphore <- struct{}{}:
 			case <-ctx.Done():
-				return
+				break dispatch
 			}
 
 			wg.Add(1)

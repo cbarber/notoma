@@ -21,7 +21,12 @@ type Transformer struct {
 	attachmentDownloader *AttachmentDownloader
 	downloadAttachments  bool
 	dateFormatter        *DateFormatter
+	pageLinkTarget       PageLinkTarget
 }
+
+// PageLinkTarget returns the vault path, without extension, that a link
+// to the child page id titled title should point at.
+type PageLinkTarget func(id, title string) string
 
 // TransformerOption configures a Transformer.
 type TransformerOption func(*Transformer)
@@ -40,6 +45,14 @@ func WithDateFormatter(df *DateFormatter) TransformerOption {
 		if df != nil {
 			t.dateFormatter = df
 		}
+	}
+}
+
+// WithPageLinkTarget makes child page links point at the filename the
+// sync allocated for each page instead of its raw title.
+func WithPageLinkTarget(target PageLinkTarget) TransformerOption {
+	return func(t *Transformer) {
+		t.pageLinkTarget = target
 	}
 }
 
@@ -191,7 +204,7 @@ func (t *Transformer) blockToMarkdown(block notionapi.Block, indent int) (string
 		return t.equationToMarkdown(b, indentStr)
 
 	case *notionapi.ChildPageBlock:
-		return indentStr + "[[" + b.ChildPage.Title + "]]\n\n", nil
+		return indentStr + t.childPageLink(string(b.ID), b.ChildPage.Title) + "\n\n", nil
 
 	case *notionapi.ChildDatabaseBlock:
 		return indentStr + "[[" + b.ChildDatabase.Title + "]]\n\n", nil
@@ -764,6 +777,19 @@ func (t *Transformer) columnToMarkdown(b *notionapi.ColumnBlock, indent string) 
 	}
 
 	return t.blocksToMarkdownWithIndent(children, 0)
+}
+
+// childPageLink links to a child page, keeping its title as the display
+// text when the target filename differs.
+func (t *Transformer) childPageLink(id, title string) string {
+	if t.pageLinkTarget == nil {
+		return "[[" + title + "]]"
+	}
+	target := t.pageLinkTarget(id, title)
+	if target == title {
+		return "[[" + target + "]]"
+	}
+	return "[[" + target + "|" + title + "]]"
 }
 
 // fetchChildren fetches child blocks if a fetcher is available.
