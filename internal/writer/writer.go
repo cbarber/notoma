@@ -2,10 +2,13 @@
 package writer
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Writer handles writing files to the Obsidian vault.
@@ -155,4 +158,95 @@ func (w *Writer) GetVaultPath() string {
 // GetAttachmentFolder returns the attachment folder name.
 func (w *Writer) GetAttachmentFolder() string {
 	return w.attachmentFolder
+}
+
+// NotionID returns the notion-id recorded in the frontmatter of the file at
+// relPath, or "" if the file doesn't exist or records none. The legacy
+// notion_id key written by older versions is also accepted.
+func (w *Writer) NotionID(relPath string) (string, error) {
+	if !inVault(relPath) {
+		return "", fmt.Errorf("reading %q: path is outside the vault", relPath)
+	}
+	f, err := os.Open(filepath.Join(w.vaultPath, relPath))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+
+	scanner := bufio.NewScanner(f)
+	if !scanner.Scan() || scanner.Text() != "---" {
+		return "", scanner.Err()
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "---" {
+			break
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if ok && (key == "notion-id" || key == "notion_id") {
+			return strings.Trim(strings.TrimSpace(value), `"'`), nil
+		}
+	}
+	return "", scanner.Err()
+}
+
+// inVault reports whether relPath names something inside the vault, not
+// the vault itself or anything outside it.
+func inVault(relPath string) bool {
+	return filepath.IsLocal(relPath) && filepath.Clean(relPath) != "."
+}
+
+// Remove deletes the file at relPath; a missing file is not an error.
+func (w *Writer) Remove(relPath string) error {
+	if !inVault(relPath) {
+		return fmt.Errorf("removing %q: path is outside the vault", relPath)
+	}
+	fullPath := filepath.Join(w.vaultPath, relPath)
+	if w.dryRun {
+		w.logger.Info("would remove", "path", fullPath)
+		return nil
+	}
+	if err := os.Remove(fullPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("removing %s: %w", fullPath, err)
+	}
+	w.logger.Debug("removed file", "path", fullPath)
+	return nil
+}
+
+// Move renames the file or folder at from to to, both relative to the
+// vault. A missing source is not an error; an existing target is.
+func (w *Writer) Move(from, to string) error {
+	// Paths come from Notion titles; never act on the vault itself or
+	// anything outside it.
+	if !inVault(from) || !inVault(to) {
+		return fmt.Errorf("moving %q to %q: path is outside the vault", from, to)
+	}
+	src := filepath.Join(w.vaultPath, from)
+	dst := filepath.Join(w.vaultPath, to)
+	if w.dryRun {
+		w.logger.Info("would move", "from", src, "to", dst)
+		return nil
+	}
+	if _, err := os.Stat(src); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	// os.Rename silently replaces files, so refuse an existing target
+	// unless it is the source itself (a case-only rename on APFS).
+	if dstInfo, err := os.Lstat(dst); err == nil {
+		srcInfo, srcErr := os.Lstat(src)
+		if srcErr != nil || !os.SameFile(srcInfo, dstInfo) {
+			return fmt.Errorf("moving %s: %s already exists", src, dst)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("creating directory for %s: %w", dst, err)
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("moving %s to %s: %w", src, dst, err)
+	}
+	w.logger.Debug("moved", "from", src, "to", dst)
+	return nil
 }

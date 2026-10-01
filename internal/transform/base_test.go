@@ -687,9 +687,9 @@ func TestGenerateFrontmatter(t *testing.T) {
 		t.Error("frontmatter should end with ---")
 	}
 
-	// Check it contains notion_id
-	if !contains(frontmatter, "notion_id: abc123") {
-		t.Error("frontmatter should contain notion_id")
+	// Check it contains notion-id
+	if !contains(frontmatter, "notion-id: abc123") {
+		t.Error("frontmatter should contain notion-id")
 	}
 
 	// Check it's valid YAML
@@ -712,9 +712,9 @@ func TestGenerateFrontmatter_Empty(t *testing.T) {
 		t.Fatalf("GenerateFrontmatter() error = %v", err)
 	}
 
-	// Should still contain notion_id even if properties are empty
-	if !contains(frontmatter, "notion_id: abc") {
-		t.Errorf("frontmatter should contain notion_id, got %q", frontmatter)
+	// Should still contain notion-id even if properties are empty
+	if !contains(frontmatter, "notion-id: abc") {
+		t.Errorf("frontmatter should contain notion-id, got %q", frontmatter)
 	}
 }
 
@@ -1250,4 +1250,30 @@ func contains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestPageFrontmatter(t *testing.T) {
+	if got := PageFrontmatter("abc-123"); got != "---\nnotion-id: abc-123\n---\n" {
+		t.Errorf("PageFrontmatter() = %q", got)
+	}
+}
+
+func TestRetargetBaseFile(t *testing.T) {
+	schema := &DatabaseSchema{Properties: map[string]PropertyMapping{}}
+	base, err := GenerateBaseFile(schema, "Action Items")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := MarshalBaseFile(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := RetargetBaseFile(content, "Action Items (3c0096f0)")
+	if err != nil {
+		t.Fatalf("RetargetBaseFile() error = %v", err)
+	}
+	if !contains(string(got), `file.inFolder("Action Items (3c0096f0)")`) || contains(string(got), `inFolder("Action Items")`) {
+		t.Errorf("RetargetBaseFile() = %s", got)
+	}
 }

@@ -117,6 +117,27 @@ docker run --rm \
   notoma sync --config /config.yaml
 ```
 
+## Output Layout
+
+Pages are written flat, as `Title.md`. Database entries go in a folder named after the database, next to its `.base` file. Each synced page and database entry starts with frontmatter recording its Notion ID, using the same key as Obsidian's Notion importer:
+
+```yaml
+---
+notion-id: 3c0096f0-3c9b-8121-abca-ec34a6f22932
+---
+```
+
+Names that differ only in case count as the same name. When two pages, entries or databases would get the same path:
+
+- The one already at that path in the sync state keeps it. With no earlier owner, the first one synced keeps it. Configured roots sync in config order and discovered roots in ID order, so the outcome is deterministic.
+- The other gets the last 8 hex characters of its ID as a suffix, as in `Engineering (c27d1c3a).md`. If that name is taken too, the full ID is used.
+- A suffixed file keeps its name on later runs, even if the bare name frees up.
+- Links to child pages point at the suffixed name.
+
+When a page is renamed in Notion, its file is moved to the new name. Notoma deletes the old file only if that file's `notion-id` matches the page.
+
+**Upgrading from an earlier version:** run `notoma sync --force` once. Files written by earlier versions have no `notion-id` frontmatter (pages) or use the older `notion_id` key (database entries). Until a file is rewritten, a renamed page leaves its old file behind.
+
 ## Development
 
 ```bash

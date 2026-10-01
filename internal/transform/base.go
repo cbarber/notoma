@@ -172,7 +172,7 @@ func GenerateBaseFile(schema *DatabaseSchema, folderPath string) (*BaseFile, err
 	base := &BaseFile{
 		Filters: &FilterGroup{
 			And: []string{
-				fmt.Sprintf("file.inFolder(\"%s\")", folderPath),
+				inFolderFilter(folderPath),
 			},
 		},
 		Display: make(map[string]string),
@@ -490,8 +490,8 @@ func GenerateFrontmatter(entry *EntryData) (string, error) {
 		props[k] = v
 	}
 
-	// Add notion_id for tracking
-	props["notion_id"] = entry.PageID
+	// notion-id ties the file to its page; the key matches Obsidian's importer
+	props[NotionIDKey] = entry.PageID
 
 	// Add icon if set
 	if entry.Icon != "" {
@@ -509,6 +509,32 @@ func GenerateFrontmatter(entry *EntryData) (string, error) {
 	}
 
 	return fmt.Sprintf("---\n%s---\n", string(data)), nil
+}
+
+// NotionIDKey is the frontmatter key holding a synced file's Notion ID.
+const NotionIDKey = "notion-id"
+
+// PageFrontmatter returns the frontmatter for a standalone page.
+func PageFrontmatter(pageID string) string {
+	return fmt.Sprintf("---\n%s: %s\n---\n", NotionIDKey, pageID)
+}
+
+// RetargetBaseFile rewrites a .base file's folder filter to folderPath,
+// for when a database folder is moved.
+func RetargetBaseFile(content []byte, folderPath string) ([]byte, error) {
+	var base BaseFile
+	if err := yaml.Unmarshal(content, &base); err != nil {
+		return nil, fmt.Errorf("parsing base file: %w", err)
+	}
+	if base.Filters == nil {
+		base.Filters = &FilterGroup{}
+	}
+	base.Filters.And = []string{inFolderFilter(folderPath)}
+	return MarshalBaseFile(&base)
+}
+
+func inFolderFilter(folderPath string) string {
+	return fmt.Sprintf("file.inFolder(\"%s\")", folderPath)
 }
 
 // DatabaseEntry represents a complete entry ready to be written.

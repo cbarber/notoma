@@ -8,6 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -46,6 +49,8 @@ type syncContext struct {
 	visited map[string]bool
 	// configuredRoots holds the IDs of roots listed in the config.
 	configuredRoots map[string]bool
+	// paths hands out collision-free vault paths keyed by Notion ID.
+	paths *sync.PathAllocator
 }
 
 var syncCmd = &cobra.Command{
@@ -187,6 +192,10 @@ func runSync(cmd *cobra.Command, args []string) error {
 		}
 		logger.Info("discovered workspace roots", "count", len(discovered))
 
+		// The search API's order varies; within a run the first claim on
+		// a name wins, so a fixed order keeps fresh syncs deterministic.
+		sort.Slice(discovered, func(i, j int) bool { return discovered[i].ID < discovered[j].ID })
+
 		// Convert discovered resources to config.Root format
 		for _, res := range discovered {
 			// Use Notion URL format for discovered roots
@@ -222,6 +231,7 @@ func runSync(cmd *cobra.Command, args []string) error {
 		dryRun:           dryRun,
 		visited:          make(map[string]bool),
 		configuredRoots:  configuredRootIDs(cfg.Sync.Roots),
+		paths:            sync.NewPathAllocator(state),
 	}
 
 	// Attachments are written before each checkpoint so the state never
@@ -418,41 +428,15 @@ func syncPageRecursive(sc *syncContext, resource *notion.Resource, folderPath st
 		return fmt.Errorf("fetching page blocks: %w", err)
 	}
 
-	filename := transform.SanitizeFilename(resource.Title) + ".md"
-	localPath := filename
-	if folderPath != "" {
-		localPath = folderPath + "/" + filename
-	}
-
 	fetcher := newBlockCache(sc.client)
 	if sc.dryRun {
+		localPath := sc.allocatePage(resource.ID, folderPath, resource.Title)
 		sc.logger.Info("would sync page", "title", resource.Title, "blocks", len(blocks), "path", localPath)
 	} else {
-		// Transform blocks to markdown (with attachment downloading and date formatting)
-		transformer := transform.NewTransformerWithOptions(sc.ctx, fetcher, sc.attDownloader, sc.dateFormatter)
-
-		markdown, err := transformer.BlocksToMarkdown(blocks)
+		localPath, err := writePage(sc, resource, folderPath, blocks, fetcher, lastModified)
 		if err != nil {
-			return fmt.Errorf("transforming blocks: %w", err)
+			return err
 		}
-
-		// Write markdown file
-		if err := sc.writer.WriteMarkdown(folderPath, filename, markdown); err != nil {
-			return fmt.Errorf("writing markdown: %w", err)
-		}
-
-		// Update state
-		sc.state.SetResource(sync.ResourceState{
-			ID:           resource.ID,
-			Type:         sync.ResourceTypePage,
-			Title:        resource.Title,
-			LastModified: lastModified,
-			LocalPath:    localPath,
-		})
-
-		// Update timestamp in Notion
-		_ = sc.timestampUpdater.UpdateAfterSync(sc.ctx, resource.ID)
-
 		sc.logger.Info("synced page", "title", resource.Title, "file", localPath)
 	}
 
@@ -469,46 +453,152 @@ func processChildPageWithBlocks(sc *syncContext, resource *notion.Resource, bloc
 		return nil
 	}
 
-	filename := transform.SanitizeFilename(resource.Title) + ".md"
-	localPath := filename
-	if folderPath != "" {
-		localPath = folderPath + "/" + filename
-	}
-
 	fetcher := newBlockCache(sc.client)
 	if sc.dryRun {
+		localPath := sc.allocatePage(resource.ID, folderPath, resource.Title)
 		sc.logger.Info("would sync child page", "title", resource.Title, "blocks", len(blocks), "path", localPath)
 	} else {
-		// Transform blocks to markdown (with attachment downloading and date formatting)
-		transformer := transform.NewTransformerWithOptions(sc.ctx, fetcher, sc.attDownloader, sc.dateFormatter)
-
-		markdown, err := transformer.BlocksToMarkdown(blocks)
+		localPath, err := writePage(sc, resource, folderPath, blocks, fetcher, lastModified)
 		if err != nil {
-			return fmt.Errorf("transforming blocks: %w", err)
+			return err
 		}
-
-		// Write markdown file
-		if err := sc.writer.WriteMarkdown(folderPath, filename, markdown); err != nil {
-			return fmt.Errorf("writing markdown: %w", err)
-		}
-
-		// Update state
-		sc.state.SetResource(sync.ResourceState{
-			ID:           resource.ID,
-			Type:         sync.ResourceTypePage,
-			Title:        resource.Title,
-			LastModified: lastModified,
-			LocalPath:    localPath,
-		})
-
-		// Update timestamp in Notion
-		_ = sc.timestampUpdater.UpdateAfterSync(sc.ctx, resource.ID)
-
 		sc.logger.Info("synced child page", "title", resource.Title, "file", localPath)
 	}
 
 	syncNestedChildren(sc, resource, blocks, fetcher, folderPath, visited)
 	return nil
+}
+
+// writePage renders a page, writes it with its notion-id frontmatter and
+// records it in state, returning the path written.
+func writePage(sc *syncContext, resource *notion.Resource, folderPath string, blocks []notionapi.Block, fetcher transform.BlockFetcher, lastModified time.Time) (string, error) {
+	markdown, err := sc.newTransformer(fetcher, folderPath).BlocksToMarkdown(blocks)
+	if err != nil {
+		return "", fmt.Errorf("transforming blocks: %w", err)
+	}
+
+	// Allocate after rendering, which allocates the child pages it links
+	// to, so a same-named child claims its name in document order.
+	localPath := sc.allocatePage(resource.ID, folderPath, resource.Title)
+	var priorPath string
+	if prior := sc.state.GetResource(resource.ID); prior != nil {
+		priorPath = prior.LocalPath
+	}
+	sc.renameCaseOnly(resource.ID, priorPath, localPath)
+	if err := sc.writer.WriteMarkdown("", localPath, transform.PageFrontmatter(resource.ID)+"\n"+markdown); err != nil {
+		return "", fmt.Errorf("writing markdown: %w", err)
+	}
+	sc.removeStale(resource.ID, priorPath, localPath)
+
+	sc.state.SetResource(sync.ResourceState{
+		ID:           resource.ID,
+		Type:         sync.ResourceTypePage,
+		Title:        resource.Title,
+		LastModified: lastModified,
+		LocalPath:    localPath,
+	})
+
+	// Update timestamp in Notion
+	_ = sc.timestampUpdater.UpdateAfterSync(sc.ctx, resource.ID)
+	return localPath, nil
+}
+
+// newTransformer returns a transformer whose child page links point at
+// the paths allocated for pages written into folderPath.
+func (sc *syncContext) newTransformer(fetcher transform.BlockFetcher, folderPath string) *transform.Transformer {
+	return transform.NewTransformer(sc.ctx, fetcher,
+		transform.WithAttachmentDownloader(sc.attDownloader),
+		transform.WithDateFormatter(sc.dateFormatter),
+		transform.WithPageLinkTarget(func(id, title string) string {
+			dir := folderPath
+			// Configured roots are written to the vault root by their own root.
+			if sc.configuredRoots[id] {
+				dir = ""
+			}
+			// The vault-relative path keeps links exact when same-named
+			// pages live in different folders.
+			return strings.TrimSuffix(sc.allocatePage(id, dir, title), ".md")
+		}),
+	)
+}
+
+// allocatePage returns the collision-free markdown path for a page.
+func (sc *syncContext) allocatePage(id, folderPath, title string) string {
+	return sc.allocate(id, folderPath, transform.SanitizeFilename(title), ".md")
+}
+
+// allocate returns id's collision-free path. An empty ext allocates a
+// database folder.
+func (sc *syncContext) allocate(id, dir, name, ext string) string {
+	// These would resolve to the vault root or outside the vault.
+	if name == "" || name == "." || name == ".." {
+		name = "Untitled"
+	}
+	return sc.paths.Allocate(id, dir, name, ext)
+}
+
+// renameCaseOnly moves id's file when only its name's case changed. On a
+// case-insensitive filesystem writing the new name would otherwise keep
+// the old case; on a case-sensitive one it would leave a duplicate.
+func (sc *syncContext) renameCaseOnly(id, oldPath, newPath string) {
+	if oldPath == newPath || !strings.EqualFold(oldPath, newPath) {
+		return
+	}
+	owner, err := sc.writer.NotionID(oldPath)
+	if err != nil || owner != id {
+		return
+	}
+	if err := sc.writer.Move(oldPath, newPath); err != nil {
+		sc.logger.Error("failed to rename file", "from", oldPath, "to", newPath, "error", err)
+	}
+}
+
+// moveDatabaseFolder moves a database's entry folder and its .base file,
+// pointing the .base filter at the new folder.
+func (sc *syncContext) moveDatabaseFolder(from, to string) error {
+	if err := sc.writer.Move(from, to); err != nil {
+		return err
+	}
+	sc.state.RelocateFolder(from, to)
+
+	// Move the .base before rewriting it so a case-only rename on a
+	// case-insensitive filesystem changes the name too.
+	if err := sc.writer.Move(from+".base", to+".base"); err != nil {
+		return err
+	}
+	content, err := os.ReadFile(filepath.Join(sc.writer.GetVaultPath(), to+".base"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading base file: %w", err)
+	}
+	content, err = transform.RetargetBaseFile(content, to)
+	if err != nil {
+		return err
+	}
+	return sc.writer.WriteBase("", to, content)
+}
+
+// removeStale deletes id's file at its previous path once it has been
+// written elsewhere, but only if that file's notion-id says it is id's.
+func (sc *syncContext) removeStale(id, oldPath, newPath string) {
+	// renameCaseOnly already moved a file whose name changed only in case.
+	if oldPath == "" || strings.EqualFold(oldPath, newPath) {
+		return
+	}
+	owner, err := sc.writer.NotionID(oldPath)
+	if err != nil {
+		sc.logger.Error("failed to read previous file", "path", oldPath, "error", err)
+		return
+	}
+	if owner != id {
+		sc.logger.Debug("leaving previous path, not owned by this page", "path", oldPath, "owner", owner)
+		return
+	}
+	if err := sc.writer.Remove(oldPath); err != nil {
+		sc.logger.Error("failed to remove previous file", "path", oldPath, "error", err)
+	}
 }
 
 // syncChildPages fetches the given child pages in parallel and syncs each
@@ -524,6 +614,11 @@ func syncChildPages(sc *syncContext, parent *notion.Resource, childPages []child
 		// Skip already visited pages
 		if visited[child.id] {
 			sc.logger.Debug("skipping already visited child", "id", child.id)
+			continue
+		}
+		// A configured root is written where its own root puts it.
+		if sc.configuredRoots[child.id] {
+			sc.logger.Debug("leaving configured root page to its root", "id", child.id)
 			continue
 		}
 		childMap[child.id] = child
@@ -746,10 +841,11 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 	}
 
 	// Determine folder path for entries
-	folder := transform.SanitizeFilename(resource.Title)
+	name := resource.Title
 	if folderName != "" && !isUUIDPrefix(folderName) {
-		folder = transform.SanitizeFilename(folderName)
+		name = folderName
 	}
+	folder := sc.allocate(resource.ID, "", transform.SanitizeFilename(name), "")
 
 	// Query database entries
 	pages, err := sc.client.QueryDatabase(sc.ctx, resource.ID)
@@ -759,6 +855,15 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 
 	// Initialize or get database state
 	dbState := sc.state.GetResource(resource.ID)
+	if dbState != nil && dbState.LocalPath != "" && dbState.LocalPath != folder {
+		if err := sc.moveDatabaseFolder(dbState.LocalPath, folder); err != nil {
+			// Resync every entry into the new folder instead.
+			sc.logger.Error("failed to move database folder", "from", dbState.LocalPath, "to", folder, "error", err)
+			dbState.Entries = make(map[string]sync.EntryState)
+		}
+		dbState.LocalPath = folder
+		sc.state.SetResource(*dbState)
+	}
 	if dbState == nil {
 		sc.state.SetResource(sync.ResourceState{
 			ID:           resource.ID,
@@ -804,7 +909,7 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 	if err != nil {
 		return fmt.Errorf("marshaling base file: %w", err)
 	}
-	if err := sc.writer.WriteBase("", resource.Title, baseContent); err != nil {
+	if err := sc.writer.WriteBase("", folder, baseContent); err != nil {
 		return fmt.Errorf("writing base file: %w", err)
 	}
 
@@ -863,8 +968,12 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 			// Process the entry with pre-fetched blocks; the cache is per
 			// entry so the nested-children scan below reuses its fetches.
 			fetcher := newBlockCache(sc.client)
-			transformer := transform.NewTransformerWithOptions(sc.ctx, fetcher, sc.attDownloader, sc.dateFormatter)
-			filename, err := syncDatabaseEntryWithBlocks(sc, transformer, page, result.Blocks, schema, folder)
+			transformer := sc.newTransformer(fetcher, folder)
+			var priorPath string
+			if prior := sc.state.GetEntry(resource.ID, pageID); prior != nil {
+				priorPath = path.Join(folder, prior.LocalFile)
+			}
+			filename, err := syncDatabaseEntryWithBlocks(sc, transformer, page, result.Blocks, schema, folder, priorPath)
 			if err != nil {
 				sc.logger.Error("failed to sync entry", "id", pageID, "error", err)
 				if sc.tuiRunner != nil {
@@ -916,7 +1025,8 @@ func syncDatabase(sc *syncContext, resource *notion.Resource, folderName string)
 
 // syncDatabaseEntryWithBlocks syncs a single database entry using pre-fetched blocks.
 // Returns the filename written and any error.
-func syncDatabaseEntryWithBlocks(sc *syncContext, transformer *transform.Transformer, page *notionapi.Page, blocks []notionapi.Block, schema *transform.DatabaseSchema, folder string) (string, error) {
+// priorPath is where the entry was written before, or "".
+func syncDatabaseEntryWithBlocks(sc *syncContext, transformer *transform.Transformer, page *notionapi.Page, blocks []notionapi.Block, schema *transform.DatabaseSchema, folder, priorPath string) (string, error) {
 	// Extract entry data for frontmatter using the transformer's date formatter
 	entry, err := transform.ExtractEntryData(page, schema, transformer.GetDateFormatter())
 	if err != nil {
@@ -935,14 +1045,18 @@ func syncDatabaseEntryWithBlocks(sc *syncContext, transformer *transform.Transfo
 		return "", fmt.Errorf("building entry: %w", err)
 	}
 
-	// Write the file
+	// Allocate after rendering, as writePage does
+	pageID := string(page.ID)
+	localPath := sc.allocate(pageID, folder, strings.TrimSuffix(dbEntry.Filename, ".md"), ".md")
+	sc.renameCaseOnly(pageID, priorPath, localPath)
 	content := dbEntry.Frontmatter + "\n" + dbEntry.Content
-	if err := sc.writer.WriteMarkdown(folder, dbEntry.Filename, content); err != nil {
+	if err := sc.writer.WriteMarkdown("", localPath, content); err != nil {
 		return "", fmt.Errorf("writing entry: %w", err)
 	}
+	sc.removeStale(pageID, priorPath, localPath)
 
-	sc.logger.Debug("synced entry", "title", entry.Title, "file", dbEntry.Filename)
-	return dbEntry.Filename, nil
+	sc.logger.Debug("synced entry", "title", entry.Title, "file", localPath)
+	return path.Base(localPath), nil
 }
 
 // isUUIDPrefix checks if the name looks like a truncated UUID (e.g., "1e567c00...").

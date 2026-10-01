@@ -394,6 +394,28 @@ func TestChildPageBlock(t *testing.T) {
 	}
 }
 
+func TestChildPageBlock_LinkTarget(t *testing.T) {
+	block := func(id, title string) notionapi.Block {
+		b := &notionapi.ChildPageBlock{BasicBlock: notionapi.BasicBlock{ID: notionapi.BlockID(id), Type: notionapi.BlockTypeChildPage}}
+		b.ChildPage.Title = title
+		return b
+	}
+	targets := map[string]string{"a": "Engineering", "b": "Engineering (68f93ef0)"}
+	transformer := NewTransformer(context.Background(), nil, WithPageLinkTarget(func(id, title string) string {
+		return targets[id]
+	}))
+
+	result, err := transformer.BlocksToMarkdown([]notionapi.Block{block("a", "Engineering"), block("b", "Engineering")})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expected := "[[Engineering]]\n\n[[Engineering (68f93ef0)|Engineering]]\n\n"
+	if result != expected {
+		t.Errorf("got %q, want %q", result, expected)
+	}
+}
+
 func TestChildDatabaseBlock(t *testing.T) {
 	block := &notionapi.ChildDatabaseBlock{
 		BasicBlock: notionapi.BasicBlock{Type: notionapi.BlockTypeChildDatabase},
